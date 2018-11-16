@@ -2,6 +2,10 @@ package mapreduce
 
 import (
 	"hash/fnv"
+    "io/ioutil"
+    "encoding/json"
+    "log"
+    "os"
 )
 
 func doMap(
@@ -11,6 +15,44 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
+    //
+    // Problem: drive the map function and split the output to the intermediate files.
+    // Pass the content to the map function.
+    // Loop the results:
+    //   get the file name to store the result.
+    //   encode the key, value to JSON dictionary.
+    //   write to the file.
+    // Note: we can group the result by key.
+    //
+
+    contents, err := ioutil.ReadFile(inFile)
+    if err != nil {
+        log.Println(err)
+        os.Exit(1)
+    }
+
+    results:= mapF(inFile, string(contents))
+    for _, v := range results {
+       r := ihash(v.Key) % nReduce
+       filename := reduceName(jobName, mapTask, r)
+       file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
+       if err != nil {
+           log.Println(err)
+           os.Exit(2)
+       }
+       enc := json.NewEncoder(file)
+       err = enc.Encode(&v)
+       if err != nil {
+           log.Println(err)
+           os.Exit(3)
+       }
+
+       if err := file.Close(); err != nil {
+        log.Println(err)
+        os.Exit(4)
+       }
+    } 
+
 	//
 	// doMap manages one map task: it should read one of the input files
 	// (inFile), call the user-defined map function (mapF) for that file's
