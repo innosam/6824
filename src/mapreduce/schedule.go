@@ -100,9 +100,15 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
                     go func() {
                         fmt.Printf("Scheduling %d worker: %d \n", taskId, worker)
                         task := DoTaskArgs{jobName, mapFiles[taskId], phase, taskId, n_other}
-                        call(worker,"Worker.DoTask", task, nil)
-                        fmt.Printf("TaskComplete %d\n", taskId)
-                        wg.Done()
+                        result := call(worker,"Worker.DoTask", task, nil)
+                        if  result == true {
+                          fmt.Printf("TaskComplete %d\n", taskId)
+                          wg.Done()
+                        } else {
+                          fmt.Printf("TaskFailed %d\n", taskId)
+                          tasks <- taskId
+                        }
+
                         delete(m, worker)
                         registerChan<-worker
                     }()
