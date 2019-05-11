@@ -11,6 +11,7 @@ import "sync"
 // suitable for passing to call(). registerChan will yield all
 // existing registered workers (if any) and new ones as they register.
 //
+
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
 	var ntasks int
 	var n_other int // number of inputs (for reduce) or outputs (for map)
@@ -40,15 +41,13 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
     //     - exit if all are completed.
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
+
     var wg sync.WaitGroup
-    m := make(map[string]int)
-
     wg.Add(ntasks)
-    freeWorkers := make(chan string)
-    completed := make(chan struct{})
 
-    var done bool
-    done = false
+    m := make(map[string]int)
+    completed := make(chan struct{})
+    done := false
 
     go func() {
         fmt.Printf("wait group started\n")
@@ -63,6 +62,7 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
     for {
         if done {
+            fmt.Printf("Exiting the for loop.\n")
             break
         }
 
@@ -70,8 +70,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
         select
             {
                 case worker := <-registerChan:
-                    fmt.Printf("Scheduling on worker: %d \n",worker)
-                    // Take a lock before reading the dictionary.
                     if _, ok := m[worker]; ok {
                         break;
                     }
@@ -79,56 +77,25 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
                     taskId := counter
                     counter += 1
+
                     if taskId >=  ntasks{
                         fmt.Printf("All task done\n")
                         break
                     }
 
                     go func() {
-                        fmt.Printf("REGISTERCHAN\n")
                         fmt.Printf("Scheduling %d worker: %d \n", taskId, worker)
                         task := DoTaskArgs{jobName, mapFiles[taskId], phase, taskId, n_other}
                         call(worker,"Worker.DoTask", task, nil)
                         fmt.Printf("TaskComplete %d\n", taskId)
                         wg.Done()
-                        freeWorkers<-worker
                         delete(m, worker)
-                    }()
-
-                case worker := <-freeWorkers:
-                    fmt.Printf("Scheduling on worker: %d \n",worker)
-                    // Take a lock before reading the dictionary.
-                    if _, ok := m[worker]; ok {
-                        break;
-                    }
-
-                    taskId := counter
-                    counter += 1
-                    if taskId >=  ntasks{
-                        fmt.Printf("All task done\n")
-                        break
-                    }
-
-                    go func() {
-                        fmt.Printf("FREEWORKERS\n")
-                        if _, ok := m[worker]; !ok {
-                        fmt.Printf("Scheduling %d worker: %d for %v\n", taskId, worker, phase)
-                        m[worker] = 1
-                        task := DoTaskArgs{jobName, mapFiles[taskId], phase, taskId, n_other}
-                        call(worker,"Worker.DoTask", task, nil)
-                        fmt.Printf("TaskComplete %d\n", taskId)
-                        wg.Done()
-                        freeWorkers<-worker
-                        delete(m, worker)
-                        }
+                        registerChan<-worker
                     }()
                 case <-completed:
-                    fmt.Println("completed case.\n")
-                    done = true
+                    fmt.Printf("Completed.\n")
             }
     }
 
-	// Your code here (Part III, Part IV).
-	//
 	fmt.Printf("Schedule: %v done\n", phase)
 }
