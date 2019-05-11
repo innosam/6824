@@ -49,6 +49,11 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
     completed := make(chan struct{})
     done := false
 
+    tasks := make(chan int,ntasks)
+    for i:=0;i<ntasks;i++ {
+        tasks <- i
+    }
+
     go func() {
         fmt.Printf("wait group started\n")
         wg.Wait()
@@ -57,8 +62,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
         fmt.Printf("wait group done\n")
     }()
 
-    var counter int
-    counter = 0
 
     for {
         if done {
@@ -75,11 +78,22 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
                     }
                     m[worker] = 1
 
-                    taskId := counter
-                    counter += 1
+                    var taskId int
+                    select {
+                        case taskId = <-tasks:
+                           fmt.Printf("Task %d available.\n", taskId)
+
+                        default:
+                           taskId = -1
+                    }
 
                     if taskId >=  ntasks{
                         fmt.Printf("All task done\n")
+                        break
+                    }
+
+                    if taskId == -1 {
+                        fmt.Printf("No task available.")
                         break
                     }
 
