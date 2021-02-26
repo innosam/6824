@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"io/ioutil"
 	"labrpc"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -65,20 +67,13 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
 	rf.mu.Lock()
-	term = rf.currentTerm
-	if rf.leaderID == rf.me {
-		//fmt.Printf("Leader:%d ServerId: %d, VotedFor: %d, TermId: %d \n.", rf.leaderID, rf.me, rf.votedFor, rf.currentTerm)
-		isleader = true
-	}
-
 	rf.mu.Unlock()
 
-	return term, isleader
+	log.Printf("Me: %d, Term: %d, Leader: %d", rf.me, rf.currentTerm, rf.leaderID)
+
+	return rf.currentTerm, rf.leaderID == rf.me
 }
 
 //
@@ -142,15 +137,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm < args.Term {
-		reply = &AppendEntriesReply{Term: rf.currentTerm, Success: false}
+	if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
 	}
 
-	//fmt.Printf("Append Entries Received from leader %d \n", args.LeaderID)
+	log.Printf("Append Entries received from leader %d to me %d.", args.LeaderID, rf.me)
 	rf.leaderID = args.LeaderID
 	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
-	reply = &AppendEntriesReply{Term: rf.currentTerm, Success: true}
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
 	return
 }
 
@@ -187,19 +185,22 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// fmt.Printf("%d -> %d \n", args.Term, args.CandidateID)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm > args.Term {
+	log.Printf("Request Vote TermId: %d, CandidateId: %d, Me: %d, MeTerm: %d.", args.Term, args.CandidateID, rf.me, rf.currentTerm)
+	if rf.currentTerm > args.Term ||
+		(rf.leaderID == rf.me && rf.currentTerm == args.Term) {
 		reply = &RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
 		return
 	}
 
 	rf.currentTerm = args.Term
+	rf.leaderID = -1
 	rf.votedFor = args.CandidateID
-	reply.Term = rf.currentTerm
+	reply.Term = args.Term
 	reply.VoteGranted = true
+	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
 	return
 }
 
@@ -290,6 +291,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.leaderID = -1
 
+	log.SetOutput(ioutil.Discard) // Disable Logging.
+	log.Printf("Total Peers: %d Me: %d", len(rf.peers), rf.me)
+
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -311,10 +315,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 //
 func (rf *Raft) Run() {
 	rand.Seed(time.Now().UnixNano())
-	max := 4000
-	min := 2000
-	var electionTimeout time.Duration
+	max := 300
+	min := 150
+	hearbeatInterval := 100
+
+	var electionTimeout int
 	var leader bool
+	isFollowerTimedOut := func() bool {
+		return time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp >
+			(time.Duration(min) * time.Millisecond).Nanoseconds()
+	}
 
 	for {
 		// If leader, send appendArgs.
@@ -322,35 +332,34 @@ func (rf *Raft) Run() {
 		//     hearbeat timestamp is older than the timeout
 		//     start election else sleep and assume leadership.
 		if leader {
-			electionTimeout = time.Duration(500)
+			electionTimeout = hearbeatInterval
 		} else {
-			electionTimeout = time.Duration(rand.Intn(max-min) + min)
+			electionTimeout = rand.Intn(max-min) + min
 		}
 
-		time.Sleep(electionTimeout * time.Millisecond)
-		leader = rf.ExecuteServer()
-
+		time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
+		leader = rf.ExecuteServer(isFollowerTimedOut)
 	}
 }
 
 // ExecuteServer Raft Server ...
-func (rf *Raft) ExecuteServer() bool {
+func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.leaderID == rf.me {
-		rf.SendAppendEntriesToPeer()
-		return true
+		log.Printf("I am the leader %d", rf.me)
+		return rf.SendAppendEntriesToPeer()
 	}
 
-	if time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp <= 1000000000 {
-		// fmt.Printf("Follower.\n")
+	if !isFollowerTimedOut() {
 		return false
 	}
 
-	//fmt.Printf("Going for election: %d\n", rf.me)
+	log.Printf("Going for election: %d\n.", rf.me)
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.leaderID = -1
 	votes := make(chan bool)
 	for index := range rf.peers {
 		if index == rf.me {
@@ -360,14 +369,15 @@ func (rf *Raft) ExecuteServer() bool {
 		go func(peerId int) {
 			reqestVoteMessage := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
 			responeVoteReply := RequestVoteReply{}
-			//fmt.Printf("Sending request vote %d->%d\n", rf.me, peerId)
+			log.Printf("Sending request vote %d->%d\n", rf.me, peerId)
 			rf.sendRequestVote(peerId, &reqestVoteMessage, &responeVoteReply)
 			votes <- responeVoteReply.VoteGranted
 		}(index)
 	}
 
-	//fmt.Printf("Counting Votes.\n")
+	log.Printf("Counting Votes Me: %d.\n", rf.me)
 	var voteCount int
+	length := len(rf.peers)
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
@@ -377,34 +387,46 @@ func (rf *Raft) ExecuteServer() bool {
 		if voteGranted {
 			voteCount++
 		}
+
+		if voteCount+1 >= (length+1)/2 {
+			log.Printf("I am the new leader %d", rf.me)
+			rf.leaderID = rf.me
+			return rf.SendAppendEntriesToPeer()
+		}
+
 	}
 
-	//fmt.Printf("VoteCount %d.\n", voteCount)
-	length := len(rf.peers)
-	if voteCount >= length/2 {
-		rf.leaderID = rf.me
-		rf.SendAppendEntriesToPeer()
-		return true
-	}
-
+	log.Printf("I lost the election %d", rf.me)
 	return false
 }
 
-//
-func (rf *Raft) SendAppendEntriesToPeer() {
+// SendAppendEntriesToPeer ...
+func (rf *Raft) SendAppendEntriesToPeer() bool {
+	var wg sync.WaitGroup
+
 	if rf.leaderID == rf.me {
 		for index := range rf.peers {
 			if index == rf.me {
 				continue
 			}
 
+			wg.Add(1)
+
 			go func(peerId int) {
 				appendEntriesArgs := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
 				appendEntriesReply := AppendEntriesReply{}
 				rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
+				if appendEntriesReply.Term > rf.currentTerm {
+					rf.leaderID = -1
+					rf.currentTerm = appendEntriesReply.Term
+					log.Printf("I am no longer a leader %d.", rf.me)
+				}
+
+				wg.Done()
 			}(index)
 		}
-
-		return
 	}
+
+	wg.Wait()
+	return rf.leaderID == rf.me
 }
