@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -55,9 +54,10 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 
 	// Your data here (2A, 2B, 2C).
-	currentTerm        int
-	votedFor           int
-	isElectionComplete bool
+	currentTerm       int
+	votedFor          int
+	hearbeatTimeStamp int64
+	leaderID          int
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 }
@@ -70,9 +70,9 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	rf.mu.Lock()
-
 	term = rf.currentTerm
-	if rf.votedFor == rf.me && rf.isElectionComplete {
+	if rf.leaderID == rf.me {
+		//fmt.Printf("Leader:%d ServerId: %d, VotedFor: %d, TermId: %d \n.", rf.leaderID, rf.me, rf.votedFor, rf.currentTerm)
 		isleader = true
 	}
 
@@ -120,13 +120,56 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 //
+// Append Entries Request.
+//
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID int
+}
+
+//
+// Append Entries Reply.
+//
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+//
+// example RequestVote RPC handler.
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm < args.Term {
+		reply = &AppendEntriesReply{Term: rf.currentTerm, Success: false}
+		return
+	}
+
+	//fmt.Printf("Append Entries Received from leader %d \n", args.LeaderID)
+	rf.leaderID = args.LeaderID
+	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
+	reply = &AppendEntriesReply{Term: rf.currentTerm, Success: true}
+	return
+}
+
+//
+// Send AppendEntries
+//
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	From int
-	To   int
+	Term        int
+	CandidateID int
 }
 
 //
@@ -135,6 +178,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -142,7 +187,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	fmt.Printf("%d -> %d \n", args.From, args.To)
+	// fmt.Printf("%d -> %d \n", args.Term, args.CandidateID)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm > args.Term {
+		reply = &RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+		return
+	}
+
+	rf.currentTerm = args.Term
+	rf.votedFor = args.CandidateID
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+	return
 }
 
 //
@@ -230,6 +288,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.leaderID = -1
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -252,21 +311,100 @@ func Make(peers []*labrpc.ClientEnd, me int,
 //
 func (rf *Raft) Run() {
 	rand.Seed(time.Now().UnixNano())
-	max := 500
-	min := 300
+	max := 4000
+	min := 2000
+	var electionTimeout time.Duration
+	var leader bool
 
 	for {
-		electionTimeout := time.Duration(rand.Intn(max-min) + min)
-		for index, _ := range rf.peers {
+		// If leader, send appendArgs.
+		// else if the
+		//     hearbeat timestamp is older than the timeout
+		//     start election else sleep and assume leadership.
+		if leader {
+			electionTimeout = time.Duration(500)
+		} else {
+			electionTimeout = time.Duration(rand.Intn(max-min) + min)
+		}
+
+		time.Sleep(electionTimeout * time.Millisecond)
+		leader = rf.ExecuteServer()
+
+	}
+}
+
+// ExecuteServer Raft Server ...
+func (rf *Raft) ExecuteServer() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.leaderID == rf.me {
+		rf.SendAppendEntriesToPeer()
+		return true
+	}
+
+	if time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp <= 1000000000 {
+		// fmt.Printf("Follower.\n")
+		return false
+	}
+
+	//fmt.Printf("Going for election: %d\n", rf.me)
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	votes := make(chan bool)
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+
+		go func(peerId int) {
+			reqestVoteMessage := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
+			responeVoteReply := RequestVoteReply{}
+			//fmt.Printf("Sending request vote %d->%d\n", rf.me, peerId)
+			rf.sendRequestVote(peerId, &reqestVoteMessage, &responeVoteReply)
+			votes <- responeVoteReply.VoteGranted
+		}(index)
+	}
+
+	//fmt.Printf("Counting Votes.\n")
+	var voteCount int
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+
+		voteGranted := <-votes
+		if voteGranted {
+			voteCount++
+		}
+	}
+
+	//fmt.Printf("VoteCount %d.\n", voteCount)
+	length := len(rf.peers)
+	if voteCount >= length/2 {
+		rf.leaderID = rf.me
+		rf.SendAppendEntriesToPeer()
+		return true
+	}
+
+	return false
+}
+
+//
+func (rf *Raft) SendAppendEntriesToPeer() {
+	if rf.leaderID == rf.me {
+		for index := range rf.peers {
 			if index == rf.me {
 				continue
 			}
 
-			reqestVoteMessage := RequestVoteArgs{From: rf.me, To: index}
-			responeVoteReply := RequestVoteReply{}
-			rf.sendRequestVote(index, &reqestVoteMessage, &responeVoteReply)
+			go func(peerId int) {
+				appendEntriesArgs := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
+				appendEntriesReply := AppendEntriesReply{}
+				rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
+			}(index)
 		}
 
-		time.Sleep(electionTimeout * time.Millisecond)
+		return
 	}
 }
