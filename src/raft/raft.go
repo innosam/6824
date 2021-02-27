@@ -190,7 +190,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	log.Printf("Request Vote TermId: %d, CandidateId: %d, Me: %d, MeTerm: %d.", args.Term, args.CandidateID, rf.me, rf.currentTerm)
 	if rf.currentTerm > args.Term ||
-		(rf.leaderID == rf.me && rf.currentTerm == args.Term) {
+		(rf.votedFor == rf.me && rf.currentTerm == args.Term) {
 		reply = &RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
 		return
 	}
