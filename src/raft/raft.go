@@ -69,7 +69,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
 	log.Printf("Me: %d, Term: %d, Leader: %d", rf.me, rf.currentTerm, rf.leaderID)
 
