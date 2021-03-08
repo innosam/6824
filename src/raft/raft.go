@@ -18,9 +18,11 @@ package raft
 //
 
 import (
+	"fmt"
 	"io/ioutil"
 	"labrpc"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -46,6 +48,13 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// Log reprents a log which will be placed in the logs array.
+type Log struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -54,12 +63,24 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
+	// Persistent state.
 	currentTerm       int
 	votedFor          int
-	hearbeatTimeStamp int64
+	log               []Log
 	leaderID          int
+	hearbeatTimeStamp int64
+
+	// Volatile state.
+	commitIndex int
+	applyIndex  int
+
+	// Volatie leader states.
+	nextIndex  []int // next index to be sent.
+	matchIndex []int // index of highest log entry known to be replicated.
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 }
@@ -120,6 +141,11 @@ func (rf *Raft) readPersist(data []byte) {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	CommitIndex  int
 }
 
 //
@@ -131,7 +157,7 @@ type AppendEntriesReply struct {
 }
 
 //
-// example RequestVote RPC handler.
+// example AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -143,11 +169,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	log.Printf("Append Entries received from leader %d to me %d.", args.LeaderID, rf.me)
+	log.Printf("Append Entries received from leader: %d to me: %d.", args.LeaderID, rf.me)
 	rf.leaderID = args.LeaderID
 	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
 	reply.Term = rf.currentTerm
+	rf.log = append(rf.log, args.Entries...)
 	reply.Success = true
+
+	if args.CommitIndex > rf.commitIndex {
+		if args.CommitIndex < len(rf.log) {
+			rf.commitIndex = args.CommitIndex
+		} else {
+			rf.commitIndex = len(rf.log)
+		}
+
+		log.Printf("Higher commit index received %d, me: %d.", len(args.Entries), rf.me)
+	}
 
 	return
 }
@@ -253,13 +290,22 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.leaderID == rf.me {
+		rf.log = append(
+			rf.log,
+			Log{
+				Term:    rf.currentTerm,
+				Index:   len(rf.log) + 1,
+				Command: command})
+
+		rf.SendAppendEntriesToPeer()
+	}
+
+	return len(rf.log), rf.currentTerm, rf.leaderID == rf.me
 }
 
 //
@@ -290,6 +336,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.leaderID = -1
+	rf.applyCh = applyCh
+	rf.log = []Log{}
+	rf.commitIndex = 0
 
 	log.SetOutput(ioutil.Discard) // Disable Logging.
 	log.Printf("Total Peers: %d Me: %d", len(rf.peers), rf.me)
@@ -325,6 +374,7 @@ func (rf *Raft) Run() {
 		return time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp >
 			(time.Duration(min) * time.Millisecond).Nanoseconds()
 	}
+	go rf.ApplyLongRunning()
 
 	for {
 		// If leader, send appendArgs.
@@ -339,6 +389,61 @@ func (rf *Raft) Run() {
 
 		time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
 		leader = rf.ExecuteServer(isFollowerTimedOut)
+	}
+}
+
+//
+func (rf *Raft) ApplyLongRunning() {
+	for {
+		rf.Apply()
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+//
+func (rf *Raft) Commit() {
+	commitIndex := math.MaxInt32
+	for index, num := range rf.matchIndex {
+		if rf.me == index {
+			continue
+		}
+
+		if num < commitIndex {
+			commitIndex = num
+		}
+	}
+
+	if commitIndex == rf.commitIndex {
+		log.Printf("No apply action required as commitindex %d me: %d.", commitIndex, rf.me)
+		return
+	} else if commitIndex < rf.commitIndex {
+		fmt.Printf("The min match index cannot be less than leader commit index.\n")
+	}
+
+	rf.commitIndex = commitIndex
+}
+
+//
+func (rf *Raft) Apply() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	log.Printf("Apply thread me: %d.", rf.me)
+	condition := sync.NewCond(&rf.mu)
+
+	for i := rf.applyIndex + 1; i <= rf.commitIndex; i++ {
+		go func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			log.Printf("Logs applied %d, me:%d.", i, rf.me)
+			logEntry := rf.log[i-1]
+			applyMsg := ApplyMsg{CommandValid: true, Command: logEntry.Command, CommandIndex: logEntry.Index}
+			rf.applyCh <- applyMsg
+			condition.Signal()
+		}()
+
+		condition.Wait()
+		rf.applyIndex++
 	}
 }
 
@@ -391,6 +496,11 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 		if voteCount+1 >= (length+1)/2 {
 			log.Printf("I am the new leader %d", rf.me)
 			rf.leaderID = rf.me
+			rf.nextIndex = make([]int, len(rf.peers))
+			for index, _ := range rf.nextIndex {
+				rf.nextIndex[index] = len(rf.log) + 1
+			}
+			rf.matchIndex = make([]int, len(rf.peers))
 			return rf.SendAppendEntriesToPeer()
 		}
 
@@ -413,13 +523,47 @@ func (rf *Raft) SendAppendEntriesToPeer() bool {
 			wg.Add(1)
 
 			go func(peerId int) {
-				appendEntriesArgs := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
+				// For peerId, check the last synced log.
+				// Send the prevLogIndex, prevLogTerm, entries, commitIndex.
+				// send all logs from last synced log to the peer.
+				// if response is received from majority, commit the log, else drop it.
+				// should it retry sending the log which failed?
+
+				lastLogIndex := len(rf.log)
+				var entries []Log
+				if lastLogIndex >= rf.nextIndex[peerId] {
+					entries = rf.log[rf.nextIndex[peerId]-1:]
+				}
+
+				var prevLogTerm int
+				if (rf.nextIndex[peerId] - 1) >= 1 {
+					prevLogTerm = rf.log[rf.nextIndex[peerId]-1-1].Term
+				}
+
+				appendEntriesArgs := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderID:     rf.me,
+					PrevLogIndex: rf.nextIndex[peerId] - 1,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					CommitIndex:  rf.commitIndex,
+				}
+
 				appendEntriesReply := AppendEntriesReply{}
-				rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
-				if appendEntriesReply.Term > rf.currentTerm {
+				ok := rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
+
+				if !ok {
+					log.Printf("The RPC failed peerId: %d, me: %d.", peerId, rf.me)
+				} else if appendEntriesReply.Term > rf.currentTerm {
 					rf.leaderID = -1
 					rf.currentTerm = appendEntriesReply.Term
 					log.Printf("I am no longer a leader %d.", rf.me)
+				} else if !appendEntriesReply.Success {
+					rf.nextIndex[peerId]--
+					fmt.Print("index decremented")
+				} else if appendEntriesReply.Success {
+					rf.nextIndex[peerId] = len(rf.log) + 1
+					rf.matchIndex[peerId] = len(rf.log)
 				}
 
 				wg.Done()
@@ -428,5 +572,6 @@ func (rf *Raft) SendAppendEntriesToPeer() bool {
 	}
 
 	wg.Wait()
+	rf.Commit()
 	return rf.leaderID == rf.me
 }
