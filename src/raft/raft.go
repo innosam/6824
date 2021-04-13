@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"io/ioutil"
 	"labrpc"
 	"log"
 	"math"
@@ -151,8 +152,9 @@ type AppendEntriesArgs struct {
 // Append Entries Reply.
 //
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term       int
+	Success    bool
+	PeerLogLen int
 }
 
 //
@@ -162,6 +164,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	log.Printf("Append Entries received from leader: %d to me: %d. CurrentTerm: %d, ReceivedTerm: %d", args.LeaderID, rf.me, rf.currentTerm, args.Term)
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -169,10 +172,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	logLen := len(rf.log)
-	log.Printf("Append Entries received from leader: %d to me: %d.", args.LeaderID, rf.me)
 	rf.leaderID = args.LeaderID
-	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
 	reply.Term = rf.currentTerm
+	reply.PeerLogLen = logLen
+	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
 
 	if logLen == 0 || args.PrevLogTerm == 0 {
 		log.Printf("The logs will be appended.")
@@ -244,7 +247,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	log.Printf("Request Vote TermId: %d, CandidateId: %d, Me: %d, MeTerm: %d.", args.Term, args.CandidateID, rf.me, rf.currentTerm)
 	if rf.currentTerm > args.Term ||
 		(rf.votedFor == rf.me && rf.currentTerm == args.Term) {
-		reply = &RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
@@ -254,10 +258,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(rf.log[logLen-1].Term > args.LastLogTerm ||
 			(rf.log[logLen-1].Term == args.LastLogTerm &&
 				logLen > args.LastLogIndex)) {
-		reply = &RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+		log.Printf(
+			"latest log details me - Term: %d, LogLen: %d. RequestVote - Term: %d, LastLogIndex: %d",
+			rf.log[logLen-1].Term,
+			logLen,
+			args.LastLogTerm,
+			args.LastLogIndex)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
+	log.Printf("Request Vote Granted TermId: %d, CandidateId: %d, Me: %d, MeTerm: %d.", args.Term, args.CandidateID, rf.me, rf.currentTerm)
 	rf.currentTerm = args.Term
 	rf.leaderID = -1
 	rf.votedFor = args.CandidateID
@@ -373,7 +385,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = []Log{}
 	rf.commitIndex = 0
 
-	// log.SetOutput(ioutil.Discard) // Disable Logging.
+	log.SetOutput(ioutil.Discard) // Disable Logging.
 	log.Printf("Total Peers: %d Me: %d", len(rf.peers), rf.me)
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -399,30 +411,33 @@ func (rf *Raft) Run() {
 	rand.Seed(time.Now().UnixNano())
 	max := 300
 	min := 150
-	hearbeatInterval := 100
+	hearbeatInterval := 80
 
 	var electionTimeout int
 	var leader bool
 	isFollowerTimedOut := func() bool {
 		return time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp >
-			(time.Duration(min) * time.Millisecond).Nanoseconds()
+			(time.Duration(max) * time.Millisecond).Nanoseconds()
 	}
 	go rf.ApplyLongRunning()
 	go rf.CommitLongRuning()
 
 	for {
+		rf.mu.Lock()
 		// If leader, send appendArgs.
 		// else if the
 		//     hearbeat timestamp is older than the timeout
 		//     start election else sleep and assume leadership.
+		leader = rf.leaderID == rf.me
 		if leader {
 			electionTimeout = hearbeatInterval
 		} else {
 			electionTimeout = rand.Intn(max-min) + min
 		}
 
+		rf.mu.Unlock()
 		time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
-		leader = rf.ExecuteServer(isFollowerTimedOut)
+		go rf.ExecuteServer(isFollowerTimedOut)
 	}
 }
 
@@ -534,6 +549,7 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 
+	rf.mu.Unlock()
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
@@ -547,8 +563,19 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 				LastLogTerm:  lastLogTerm}
 			responeVoteReply := RequestVoteReply{}
 			log.Printf("Sending request vote %d->%d\n", rf.me, peerId)
-			rf.sendRequestVote(peerId, &reqestVoteMessage, &responeVoteReply)
+			ok := rf.sendRequestVote(peerId, &reqestVoteMessage, &responeVoteReply)
 			votes <- responeVoteReply.VoteGranted
+			if ok {
+				log.Printf("Term received: %d, Current Term: %d, Me: %d\n", responeVoteReply.Term, rf.currentTerm, rf.me)
+				if !responeVoteReply.VoteGranted && responeVoteReply.Term > rf.currentTerm {
+					rf.mu.Lock()
+					if responeVoteReply.Term > rf.currentTerm {
+						log.Printf("Resetting the term as part of response vote - Term: %d, Me: %d", responeVoteReply.Term, rf.me)
+						rf.currentTerm = responeVoteReply.Term
+					}
+					rf.mu.Unlock()
+				}
+			}
 		}(index)
 	}
 
@@ -559,26 +586,29 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 		if index == rf.me {
 			continue
 		}
-
 		voteGranted := <-votes
+
 		if voteGranted {
 			voteCount++
 		}
 
 		if voteCount+1 >= (length+1)/2 {
 			log.Printf("I am the new leader %d", rf.me)
+			rf.mu.Lock()
 			rf.leaderID = rf.me
 			rf.nextIndex = make([]int, len(rf.peers))
 			for index, _ := range rf.nextIndex {
 				rf.nextIndex[index] = len(rf.log) + 1
 			}
 			rf.matchIndex = make([]int, len(rf.peers))
+			rf.matchIndex[rf.me] = len(rf.log)
 			go rf.SendAppendEntriesToPeer()
 			return true
 		}
 
 	}
 
+	rf.mu.Lock()
 	log.Printf("I lost the election %d", rf.me)
 	return false
 }
@@ -646,6 +676,11 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 					if rf.nextIndex[peerId] > 1 {
 						rf.nextIndex[peerId]--
 						log.Print("index decremented")
+					}
+
+					if rf.nextIndex[peerId] > appendEntriesReply.PeerLogLen {
+						log.Printf("Append entries reset the nextindex %d.", appendEntriesReply.PeerLogLen)
+						rf.nextIndex[peerId] = appendEntriesReply.PeerLogLen
 					}
 				} else if appendEntriesReply.Success {
 					log.Printf(
