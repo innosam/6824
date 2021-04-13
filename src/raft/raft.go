@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"io/ioutil"
 	"labrpc"
 	"log"
 	"math"
@@ -374,7 +373,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = []Log{}
 	rf.commitIndex = 0
 
-	log.SetOutput(ioutil.Discard) // Disable Logging.
+	// log.SetOutput(ioutil.Discard) // Disable Logging.
 	log.Printf("Total Peers: %d Me: %d", len(rf.peers), rf.me)
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -456,21 +455,19 @@ func (rf *Raft) Commit() {
 	// 1 2 2  - 2
 	//
 	commitIndex := math.MaxInt32
-	sortedIndex := rf.matchIndex
+	var sortedIndex []int = make([]int, len(rf.matchIndex))
+	copy(sortedIndex, rf.matchIndex)
 	sort.Sort(sort.Reverse(sort.IntSlice(sortedIndex)))
 
 	majority := (len(rf.peers) + 1) / 2
 	for index, num := range sortedIndex {
-		if rf.me == index {
-			continue
-		}
-
 		if num < commitIndex {
 			commitIndex = num
 		}
 
 		if index+1 >= majority {
-			log.Printf("Reached majoriy index: %d, majority: %d", index+1, majority)
+			log.Printf("Reached majority index: %d, majority: %d, value: %d, me:%d", index+1, majority, commitIndex, rf.me)
+			log.Printf("%v, ordered: %v", sortedIndex, rf.matchIndex)
 			break
 		}
 	}
@@ -482,7 +479,9 @@ func (rf *Raft) Commit() {
 		log.Printf("The min match index cannot be less than leader commit index.\n")
 	}
 
-	rf.commitIndex = commitIndex
+	if commitIndex >= 1 && rf.log[commitIndex-1].Term == rf.currentTerm {
+		rf.commitIndex = commitIndex
+	}
 }
 
 //
@@ -587,6 +586,7 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 // SendAppendEntriesToPeer ...
 func (rf *Raft) SendAppendEntriesToPeer() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if rf.leaderID == rf.me {
 		for index := range rf.peers {
@@ -601,6 +601,7 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 				// if response is received from majority, commit the log, else drop it.
 				// should it retry sending the log which failed?
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 
 				if rf.leaderID != rf.me {
 					return
@@ -631,6 +632,10 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 				ok := rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
 				rf.mu.Lock()
 
+				if rf.leaderID != rf.me {
+					return
+				}
+
 				if !ok {
 					log.Printf("The RPC failed peerId: %d, me: %d.", peerId, rf.me)
 				} else if appendEntriesReply.Term > rf.currentTerm {
@@ -643,14 +648,16 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 						log.Print("index decremented")
 					}
 				} else if appendEntriesReply.Success {
+					log.Printf(
+						"Success received append enetries me: %d, lastMatchIndex %d, peer: %d.",
+						rf.me,
+						lastLogIndex,
+						peerId)
 					rf.nextIndex[peerId] = lastLogIndex + 1
 					rf.matchIndex[peerId] = lastLogIndex
 				}
 
-				defer rf.mu.Unlock()
 			}(index)
 		}
 	}
-
-	defer rf.mu.Unlock()
 }
