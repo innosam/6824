@@ -549,36 +549,37 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 
-	rf.mu.Unlock()
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
 		}
 
-		go func(peerId int) {
-			reqestVoteMessage := RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateID:  rf.me,
-				LastLogIndex: len(rf.log),
-				LastLogTerm:  lastLogTerm}
-			responeVoteReply := RequestVoteReply{}
-			log.Printf("Sending request vote %d->%d\n", rf.me, peerId)
+		reqestVoteMessage := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateID:  rf.me,
+			LastLogIndex: len(rf.log),
+			LastLogTerm:  lastLogTerm}
+		responeVoteReply := RequestVoteReply{}
+		log.Printf("Sending request vote %d->%d\n", rf.me, index)
+
+		go func(peerId int, args *RequestVoteArgs, reply *RequestVoteReply) {
 			ok := rf.sendRequestVote(peerId, &reqestVoteMessage, &responeVoteReply)
 			votes <- responeVoteReply.VoteGranted
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if ok {
 				log.Printf("Term received: %d, Current Term: %d, Me: %d\n", responeVoteReply.Term, rf.currentTerm, rf.me)
 				if !responeVoteReply.VoteGranted && responeVoteReply.Term > rf.currentTerm {
-					rf.mu.Lock()
 					if responeVoteReply.Term > rf.currentTerm {
 						log.Printf("Resetting the term as part of response vote - Term: %d, Me: %d", responeVoteReply.Term, rf.me)
 						rf.currentTerm = responeVoteReply.Term
 					}
-					rf.mu.Unlock()
 				}
 			}
-		}(index)
+		}(index, &reqestVoteMessage, &responeVoteReply)
 	}
 
+	rf.mu.Unlock()
 	log.Printf("Counting Votes Me: %d.\n", rf.me)
 	var voteCount int
 	length := len(rf.peers)
@@ -640,7 +641,8 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 				lastLogIndex := len(rf.log)
 				var entries []Log
 				if lastLogIndex >= rf.nextIndex[peerId] {
-					entries = rf.log[rf.nextIndex[peerId]-1:]
+					entries = make([]Log, len(rf.log)-rf.nextIndex[peerId]+1)
+					copy(entries, rf.log[rf.nextIndex[peerId]-1:])
 				}
 
 				var prevLogTerm int
