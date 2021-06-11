@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"io/ioutil"
+	"labgob"
 	"labrpc"
 	"log"
 	"math"
@@ -103,14 +105,18 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
+
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.leaderID)
+	log.Printf("Encoder: %d, %d, %v, %d, %d", rf.currentTerm, rf.votedFor, rf.log, rf.leaderID, rf.me)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -122,17 +128,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var raftLog []Log
+	var leaderID int
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&raftLog) != nil ||
+		d.Decode(&leaderID) != nil {
+		log.Fatal("Failed while decoding.")
+	} else {
+		log.Printf("Decoder: %d, %d, %v, %d, %d", currentTerm, votedFor, raftLog, leaderID, rf.me)
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = raftLog
+		rf.leaderID = leaderID
+	}
 }
 
 //
@@ -152,9 +166,10 @@ type AppendEntriesArgs struct {
 // Append Entries Reply.
 //
 type AppendEntriesReply struct {
-	Term       int
-	Success    bool
-	PeerLogLen int
+	Term                   int
+	Success                bool
+	PeerLogLen             int
+	PeerNextTermOnMismatch int
 }
 
 //
@@ -176,15 +191,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.PeerLogLen = logLen
 	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
+	rf.persist()
 
-	if logLen == 0 || args.PrevLogTerm == 0 {
+	if (logLen == 0 && args.PrevLogIndex == 0) || args.PrevLogTerm == 0 {
 		log.Printf("The logs will be appended.")
 	} else if logLen < args.PrevLogIndex {
 		log.Printf("The logs will not be appended: loglen is less the prevlogindex.")
 		reply.Success = false
 		return
 	} else if rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		log.Printf("The logs will not be appended: the prevlogindex term does not match")
+		log.Printf("The logs will not be appended: the prevlogindex term does not match.")
+		index := args.PrevLogIndex - 1
+		prevTerm := -1
+		for index >= 0 {
+			if rf.log[args.PrevLogIndex-1].Term == rf.log[index].Term {
+				index--
+				continue
+			}
+
+			prevTerm = rf.log[index].Term
+			break
+		}
+
+		reply.PeerNextTermOnMismatch = prevTerm
 		reply.Success = false
 		return
 	}
@@ -192,6 +221,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = rf.log[:args.PrevLogIndex]
 	rf.log = append(rf.log, args.Entries...)
 	reply.Success = true
+	rf.persist()
 
 	if args.CommitIndex > rf.commitIndex {
 		if args.CommitIndex < len(rf.log) {
@@ -276,6 +306,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = args.Term
 	reply.VoteGranted = true
 	rf.hearbeatTimeStamp = time.Now().UTC().UnixNano()
+	rf.persist()
 	return
 }
 
@@ -344,10 +375,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				Index:   len(rf.log) + 1,
 				Command: command})
 		rf.matchIndex[rf.me] = len(rf.log)
-
+		rf.persist()
 		go rf.SendAppendEntriesToPeer()
 	} else {
-		log.Printf("Command Processed not processed as leader %d", rf.leaderID)
+		log.Printf("Command not processed as leader %d", rf.leaderID)
 	}
 
 	return len(rf.log), rf.currentTerm, rf.leaderID == rf.me
@@ -384,6 +415,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.log = []Log{}
 	rf.commitIndex = 0
+	rf.applyIndex = 0
 
 	log.SetOutput(ioutil.Discard) // Disable Logging.
 	log.Printf("Total Peers: %d Me: %d", len(rf.peers), rf.me)
@@ -391,8 +423,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
-
+	if rf.leaderID == rf.me {
+		rf.nextIndex = make([]int, len(rf.peers))
+		for index, _ := range rf.nextIndex {
+			rf.nextIndex[index] = len(rf.log) + 1
+		}
+		rf.matchIndex = make([]int, len(rf.peers))
+		rf.matchIndex[rf.me] = len(rf.log)
+	}
+	rf.mu.Unlock()
 	// Start GO ROUTINE.
 	// Periodic routine, with the next timer ser to Election Timeout which
 	// is random value between 150ms and 300ms seconds.
@@ -419,6 +460,7 @@ func (rf *Raft) Run() {
 		return time.Now().UTC().UnixNano()-rf.hearbeatTimeStamp >
 			(time.Duration(max) * time.Millisecond).Nanoseconds()
 	}
+
 	go rf.ApplyLongRunning()
 	go rf.CommitLongRuning()
 
@@ -494,6 +536,7 @@ func (rf *Raft) Commit() {
 		log.Printf("The min match index cannot be less than leader commit index.\n")
 	}
 
+	log.Printf("The commitIndex: %d, me: %d.\n", commitIndex, rf.me)
 	if commitIndex >= 1 && rf.log[commitIndex-1].Term == rf.currentTerm {
 		rf.commitIndex = commitIndex
 	}
@@ -510,6 +553,10 @@ func (rf *Raft) Apply() {
 	for i := rf.applyIndex + 1; i <= rf.commitIndex; i++ {
 		go func() {
 			rf.mu.Lock()
+			if i-1 >= len(rf.log) {
+				return
+			}
+
 			defer rf.mu.Unlock()
 			log.Printf("Logs applied %d, me:%d.", i, rf.me)
 			logEntry := rf.log[i-1]
@@ -549,6 +596,7 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 
+	rf.persist()
 	for index := range rf.peers {
 		if index == rf.me {
 			continue
@@ -573,6 +621,7 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 					if responeVoteReply.Term > rf.currentTerm {
 						log.Printf("Resetting the term as part of response vote - Term: %d, Me: %d", responeVoteReply.Term, rf.me)
 						rf.currentTerm = responeVoteReply.Term
+						rf.persist()
 					}
 				}
 			}
@@ -604,6 +653,7 @@ func (rf *Raft) ExecuteServer(isFollowerTimedOut func() bool) bool {
 			rf.matchIndex = make([]int, len(rf.peers))
 			rf.matchIndex[rf.me] = len(rf.log)
 			go rf.SendAppendEntriesToPeer()
+			rf.persist()
 			return true
 		}
 
@@ -664,25 +714,38 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 				ok := rf.sendAppendEntries(peerId, &appendEntriesArgs, &appendEntriesReply)
 				rf.mu.Lock()
 
-				if rf.leaderID != rf.me {
+				if rf.leaderID != rf.me || rf.currentTerm != appendEntriesArgs.Term {
 					return
 				}
 
 				if !ok {
-					log.Printf("The RPC failed peerId: %d, me: %d.", peerId, rf.me)
+					log.Printf("The AppendEntry RPC failed peerId: %d, me: %d.", peerId, rf.me)
 				} else if appendEntriesReply.Term > rf.currentTerm {
 					rf.leaderID = -1
 					rf.currentTerm = appendEntriesReply.Term
 					log.Printf("I am no longer a leader %d.", rf.me)
 				} else if !appendEntriesReply.Success {
-					if rf.nextIndex[peerId] > 1 {
-						rf.nextIndex[peerId]--
-						log.Print("index decremented")
-					}
-
 					if rf.nextIndex[peerId] > appendEntriesReply.PeerLogLen {
+						if appendEntriesReply.PeerLogLen >= 1 {
+							rf.nextIndex[peerId] = appendEntriesReply.PeerLogLen
+						} else if appendEntriesReply.PeerLogLen == 0 {
+							rf.nextIndex[peerId] = 1
+						}
+
 						log.Printf("Append entries reset the nextindex %d.", appendEntriesReply.PeerLogLen)
-						rf.nextIndex[peerId] = appendEntriesReply.PeerLogLen
+					} else if rf.nextIndex[peerId] > 1 {
+						// Optimize the decrement, to directly jump into the next term known by the peer.
+						if appendEntriesReply.PeerNextTermOnMismatch != -1 {
+							index := rf.nextIndex[peerId] - 1
+							for index >= 1 && rf.log[index-1].Term != appendEntriesReply.PeerNextTermOnMismatch {
+								index--
+							}
+							log.Printf("previous index %d, new index %d", rf.nextIndex[peerId], index)
+							rf.nextIndex[peerId] = index + 1
+						} else {
+							rf.nextIndex[peerId]--
+							log.Printf("index decremented %d", rf.nextIndex[peerId])
+						}
 					}
 				} else if appendEntriesReply.Success {
 					log.Printf(
@@ -694,6 +757,7 @@ func (rf *Raft) SendAppendEntriesToPeer() {
 					rf.matchIndex[peerId] = lastLogIndex
 				}
 
+				rf.persist()
 			}(index)
 		}
 	}

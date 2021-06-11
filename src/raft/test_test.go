@@ -780,7 +780,9 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
-	cfg.one(rand.Int()%10000, servers, true)
+	command := rand.Int() % 1000
+	log.Printf("Final command execution: %d.", command)
+	cfg.one(command, servers, true)
 
 	cfg.end()
 }
